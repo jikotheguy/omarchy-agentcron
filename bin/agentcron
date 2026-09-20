@@ -1,0 +1,1106 @@
+#!/usr/bin/env python3
+"""AgentCron - scheduled agent jobs for Omarchy, backed by systemd user timers.
+
+The scheduler is systemd. This CLI only defines jobs, generates units, runs
+them through a recording wrapper, and answers `status --json` for the bar
+widget. Nothing here keeps a process alive between runs.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import os
+import re
+import selectors
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+HOME = Path.home()
+PLUGIN_DIR = Path(__file__).resolve().parent.parent
+CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME") or HOME / ".config") / "agentcron"
+STATE_DIR = Path(os.environ.get("XDG_STATE_HOME") or HOME / ".local/state") / "agentcron"
+UNIT_DIR = Path(os.environ.get("XDG_CONFIG_HOME") or HOME / ".config") / "systemd/user"
+
+JOBS_DIR = CONFIG_DIR / "jobs"
+RUNS_DIR = STATE_DIR / "runs"
+LOGS_DIR = STATE_DIR / "logs"
+PENDING_DIR = STATE_DIR / "pending"
+APPROVED_DIR = STATE_DIR / "approved"
+REVISION_FILE = STATE_DIR / "revision"
+
+UNIT_PREFIX = "agentcron-"
+UNIT_MARKER = "X-AgentCron=1"
+NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
+HISTORY_LIMIT = 7
+LOG_KEEP = 20
+DEFAULT_TIMEOUT_SEC = 3600
+
+# Session variables a desktop agent job usually needs; imported from the user
+# manager when the unit environment does not already carry them.
+SESSION_ENV_KEYS = (
+    "DBUS_SESSION_BUS_ADDRESS",
+    "WAYLAND_DISPLAY",
+    "DISPLAY",
+    "XDG_RUNTIME_DIR",
+    "XDG_CURRENT_DESKTOP",
+    "HYPRLAND_INSTANCE_SIGNATURE",
+    "XDG_SESSION_TYPE",
+)
+
+
+class Fail(Exception):
+    pass
+
+
+# --------------------------------------------------------------------------- util
+
+
+def now() -> dt.datetime:
+    return dt.datetime.now().astimezone()
+
+
+def iso(moment: dt.datetime) -> str:
+    return moment.isoformat(timespec="seconds")
+
+
+def ensure_dirs() -> None:
+    for path in (JOBS_DIR, RUNS_DIR, LOGS_DIR, PENDING_DIR, APPROVED_DIR):
+        path.mkdir(parents=True, exist_ok=True)
+
+
+def bump_revision() -> int:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        current = int(REVISION_FILE.read_text().strip() or "0")
+    except (OSError, ValueError):
+        current = 0
+    current += 1
+    # Concurrent jobs bump this at the same instant; a shared temp name makes
+    # one process rename the other's file out from under it.
+    tmp = REVISION_FILE.with_name(f"revision.{os.getpid()}.tmp")
+    tmp.write_text(f"{current}\n")
+    os.replace(tmp, REVISION_FILE)
+    return current
+
+
+def read_revision() -> int:
+    try:
+        return int(REVISION_FILE.read_text().strip() or "0")
+    except (OSError, ValueError):
+        return 0
+
+
+def systemctl(*args: str, check: bool = False) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["systemctl", "--user", *args],
+        capture_output=True,
+        text=True,
+        check=check,
+    )
+
+
+def notify(headline: str, body: str, urgency: str = "normal", glyph: str = "") -> None:
+    sender = shutil.which("omarchy-notification-send")
+    if sender:
+        cmd = [sender, "-u", urgency]
+        if glyph:
+            cmd += ["-g", glyph]
+        cmd += [headline, body]
+    else:
+        sender = shutil.which("notify-send")
+        if not sender:
+            return
+        cmd = [sender, "-u", "normal" if urgency == "low" else urgency, headline, body]
+    subprocess.run(cmd, capture_output=True, text=True)
+
+
+def job_path(name: str) -> Path:
+    return JOBS_DIR / f"{name}.json"
+
+
+def unit_base(name: str) -> str:
+    return f"{UNIT_PREFIX}{name}"
+
+
+def load_job(name: str) -> dict:
+    path = job_path(name)
+    if not path.is_file():
+        raise Fail(f"no such job: {name}")
+    try:
+        return json.loads(path.read_text())
+    except json.JSONDecodeError as exc:
+        raise Fail(f"job file is corrupt: {path} ({exc})") from exc
+
+
+def save_job(job: dict) -> None:
+    JOBS_DIR.mkdir(parents=True, exist_ok=True)
+    path = job_path(job["name"])
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(job, indent=2, ensure_ascii=False) + "\n")
+    tmp.replace(path)
+
+
+def all_jobs() -> list[dict]:
+    if not JOBS_DIR.is_dir():
+        return []
+    jobs = []
+    for path in sorted(JOBS_DIR.glob("*.json")):
+        try:
+            jobs.append(json.loads(path.read_text()))
+        except json.JSONDecodeError:
+            continue
+    return jobs
+
+
+def runs_file(name: str) -> Path:
+    return RUNS_DIR / f"{name}.jsonl"
+
+
+def read_runs(name: str, limit: int = HISTORY_LIMIT) -> list[dict]:
+    path = runs_file(name)
+    if not path.is_file():
+        return []
+    try:
+        lines = path.read_text().splitlines()
+    except OSError:
+        return []
+    records = []
+    for line in lines[-limit:]:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            records.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return records
+
+
+def append_run(name: str, record: dict) -> None:
+    RUNS_DIR.mkdir(parents=True, exist_ok=True)
+    with runs_file(name).open("a") as handle:
+        handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+# --------------------------------------------------------------------- unit files
+
+
+def service_text(job: dict) -> str:
+    runner = PLUGIN_DIR / "bin" / "agentcron"
+    return f"""[Unit]
+Description=AgentCron job {job['name']}
+Documentation=https://github.com/jikotheguy/omarchy-agentcron
+{UNIT_MARKER}
+
+[Service]
+Type=oneshot
+ExecStart={runner} internal-run {shlex.quote(job['name'])}
+SyslogIdentifier=agentcron-{job['name']}
+"""
+
+
+def timer_text(job: dict) -> str:
+    persistent = "true" if job.get("persistent", True) else "false"
+    return f"""[Unit]
+Description=AgentCron timer for {job['name']}
+{UNIT_MARKER}
+
+[Timer]
+OnCalendar={job['schedule']}
+Persistent={persistent}
+AccuracySec=1s
+Unit={unit_base(job['name'])}.service
+
+[Install]
+WantedBy=timers.target
+"""
+
+
+def foreign_unit(path: Path) -> bool:
+    """True when a unit file exists but was not written by AgentCron."""
+    if not path.exists():
+        return False
+    if path.is_symlink():
+        return True
+    try:
+        return UNIT_MARKER not in path.read_text()
+    except OSError:
+        return True
+
+
+def write_units(job: dict) -> None:
+    UNIT_DIR.mkdir(parents=True, exist_ok=True)
+    service = UNIT_DIR / f"{unit_base(job['name'])}.service"
+    timer = UNIT_DIR / f"{unit_base(job['name'])}.timer"
+    for path in (service, timer):
+        if foreign_unit(path):
+            raise Fail(f"refusing to overwrite a unit AgentCron does not own: {path}")
+    service.write_text(service_text(job))
+    timer.write_text(timer_text(job))
+    systemctl("daemon-reload")
+    if job.get("paused"):
+        systemctl("disable", "--now", f"{unit_base(job['name'])}.timer")
+    else:
+        systemctl("enable", "--now", f"{unit_base(job['name'])}.timer")
+
+
+def remove_units(name: str) -> None:
+    systemctl("disable", "--now", f"{unit_base(name)}.timer")
+    for suffix in (".timer", ".service"):
+        path = UNIT_DIR / f"{unit_base(name)}{suffix}"
+        if path.exists() and not foreign_unit(path):
+            path.unlink()
+    systemctl("daemon-reload")
+
+
+def validate_calendar(expr: str) -> None:
+    result = subprocess.run(
+        ["systemd-analyze", "calendar", expr], capture_output=True, text=True
+    )
+    if result.returncode != 0:
+        message = (result.stderr or result.stdout).strip().splitlines()
+        hint = message[0] if message else "invalid calendar expression"
+        raise Fail(
+            f"invalid schedule {expr!r}: {hint}\n"
+            "AgentCron uses systemd OnCalendar syntax, not five-field cron.\n"
+            "Examples: daily | hourly | 'Mon..Fri 08:30' | '*:0/15' | '2026-12-25 09:00'"
+        )
+
+
+# ------------------------------------------------------------------ systemd query
+
+
+def timer_next_map() -> dict[str, int]:
+    """unit base name -> next elapse, epoch seconds."""
+    result = systemctl("list-timers", "--all", "--output=json", f"{UNIT_PREFIX}*")
+    if result.returncode != 0 or not result.stdout.strip():
+        return {}
+    try:
+        rows = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return {}
+    out: dict[str, int] = {}
+    for row in rows or []:
+        unit = row.get("unit") or ""
+        if not unit.endswith(".timer"):
+            continue
+        raw = row.get("next")
+        if not raw:
+            continue
+        try:
+            epoch = int(raw) // 1_000_000
+        except (TypeError, ValueError):
+            continue
+        if epoch <= 0:
+            continue
+        out[unit[: -len(".timer")]] = epoch
+    return out
+
+
+def active_services() -> set[str]:
+    """Unit base names whose .service is currently running."""
+    result = systemctl("list-units", "--all", "--output=json", f"{UNIT_PREFIX}*.service")
+    if result.returncode != 0 or not result.stdout.strip():
+        return set()
+    try:
+        rows = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return set()
+    running = set()
+    for row in rows or []:
+        unit = row.get("unit") or ""
+        state = row.get("active") or row.get("ActiveState") or ""
+        if unit.endswith(".service") and state in ("active", "activating", "reloading"):
+            running.add(unit[: -len(".service")])
+    return running
+
+
+# ------------------------------------------------------------------------- status
+
+
+def pending_path(name: str) -> Path:
+    return PENDING_DIR / f"{name}.json"
+
+
+def approval_path(name: str) -> Path:
+    return APPROVED_DIR / f"{name}.json"
+
+
+def read_pending(name: str) -> dict | None:
+    path = pending_path(name)
+    if not path.is_file():
+        return None
+    try:
+        return json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def job_state(job: dict, running: bool, pending: dict | None, last: dict | None) -> str:
+    if running:
+        return "running"
+    if job.get("paused"):
+        return "paused"
+    if pending:
+        return "waiting"
+    if last is None:
+        return "never"
+    status = last.get("status")
+    return status if status in ("ok", "attention", "failed") else "attention"
+
+
+def build_status() -> dict:
+    ensure_dirs()
+    next_map = timer_next_map()
+    running_set = active_services()
+    jobs_out = []
+    counters = {
+        "total": 0,
+        "active": 0,
+        "paused": 0,
+        "failed": 0,
+        "attention": 0,
+        "waiting": 0,
+        "running": 0,
+    }
+    next_job = None
+    next_at = None
+
+    for job in all_jobs():
+        name = job["name"]
+        base = unit_base(name)
+        history = read_runs(name)
+        last = history[-1] if history else None
+        pending = read_pending(name)
+        running = base in running_set
+        state = job_state(job, running, pending, last)
+
+        epoch = next_map.get(base)
+        next_run = (
+            iso(dt.datetime.fromtimestamp(epoch).astimezone())
+            if epoch and not job.get("paused")
+            else None
+        )
+        if next_run and (next_at is None or epoch < next_at):
+            next_at, next_job = epoch, name
+
+        counters["total"] += 1
+        counters["paused" if job.get("paused") else "active"] += 1
+        for key in ("failed", "attention", "waiting", "running"):
+            if state == key:
+                counters[key] += 1
+
+        jobs_out.append(
+            {
+                "name": name,
+                "description": job.get("description", ""),
+                "schedule": job["schedule"],
+                "mode": job.get("mode", "auto"),
+                "paused": bool(job.get("paused")),
+                "running": running,
+                "nextRunAt": next_run,
+                "state": state,
+                "pending": {"requestedAt": pending["requestedAt"]} if pending else None,
+                "lastRun": last,
+                "history": [
+                    {"startedAt": item.get("startedAt"), "status": item.get("status")}
+                    for item in history
+                ],
+            }
+        )
+
+    return {
+        "revision": read_revision(),
+        "generatedAt": iso(now()),
+        "summary": {
+            **counters,
+            "nextJob": next_job,
+            "nextRunAt": iso(dt.datetime.fromtimestamp(next_at).astimezone())
+            if next_at
+            else None,
+        },
+        "jobs": jobs_out,
+    }
+
+
+# -------------------------------------------------------------------------- runner
+
+
+def session_env(job: dict) -> dict[str, str]:
+    env = dict(os.environ)
+    missing = [key for key in SESSION_ENV_KEYS if key not in env]
+    if missing:
+        result = systemctl("show-environment")
+        if result.returncode == 0:
+            for line in result.stdout.splitlines():
+                key, _, value = line.partition("=")
+                if key in missing and value:
+                    env[key] = value
+    if job.get("path"):
+        env["PATH"] = job["path"]
+    env.update({str(k): str(v) for k, v in (job.get("env") or {}).items()})
+    env["AGENTCRON_JOB"] = job["name"]
+    return env
+
+
+def build_argv(job: dict) -> list[str]:
+    if job.get("argv"):
+        return list(job["argv"])
+    return ["bash", "-c", job["shell"]]
+
+
+def kill_tree(process: subprocess.Popen, hard: bool = False) -> None:
+    """Signal the whole process group; the child runs in its own session."""
+    sig = signal.SIGKILL if hard else signal.SIGTERM
+    try:
+        os.killpg(os.getpgid(process.pid), sig)
+    except (ProcessLookupError, PermissionError):
+        try:
+            process.kill() if hard else process.terminate()
+        except ProcessLookupError:
+            pass
+
+
+def tail_summary(text: str, limit: int = 160) -> str:
+    for line in reversed(text.strip().splitlines()):
+        line = line.strip()
+        if line:
+            return line[:limit]
+    return ""
+
+
+def prune_logs(name: str) -> None:
+    directory = LOGS_DIR / name
+    if not directory.is_dir():
+        return
+    logs = sorted(directory.glob("*.log"))
+    for stale in logs[:-LOG_KEEP]:
+        try:
+            stale.unlink()
+        except OSError:
+            pass
+
+
+def run_verify(job: dict, env: dict[str, str]) -> tuple[bool, str]:
+    verify = job.get("verify")
+    if not verify:
+        return True, ""
+    result = subprocess.run(
+        ["bash", "-c", verify],
+        cwd=job.get("cwd") or str(HOME),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    if result.returncode == 0:
+        return True, ""
+    return False, f"verify failed (exit {result.returncode}): {tail_summary(result.stdout + result.stderr)}"
+
+
+def run_result_cmd(job: dict, env: dict[str, str]) -> str:
+    """One line the panel offers for copying: where this run's output lives.
+
+    Generic on purpose. An agent job resolves its session, a build job could
+    resolve an artifact path; AgentCron only stores the first line.
+    """
+    command = job.get("resultCmd")
+    if not command:
+        return ""
+    try:
+        result = subprocess.run(
+            ["bash", "-c", command],
+            cwd=job.get("cwd") or str(HOME),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except subprocess.TimeoutExpired:
+        return ""
+    if result.returncode != 0:
+        return ""
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if line:
+            return line[:300]
+    return ""
+
+
+def internal_run(name: str) -> int:
+    ensure_dirs()
+    job = load_job(name)
+
+    if job.get("paused"):
+        return 0
+
+    approval = approval_path(name)
+    approved = approval.exists()
+    if approved:
+        approval.unlink(missing_ok=True)
+
+    if job.get("mode") == "ask" and not approved:
+        # A request already waiting keeps its original timestamp, and the user
+        # is not re-notified on every tick of a frequent schedule.
+        if read_pending(name) is None:
+            pending_path(name).write_text(
+                json.dumps({"requestedAt": iso(now())}, ensure_ascii=False) + "\n"
+            )
+            bump_revision()
+            notify(
+                "AgentCron needs approval",
+                f"{name}: {job.get('description') or job.get('shell') or ' '.join(job.get('argv') or [])}",
+                urgency="normal",
+            )
+        return 0
+
+    pending_path(name).unlink(missing_ok=True)
+
+    started = now()
+    stamp = started.strftime("%Y%m%d-%H%M%S")
+    log_dir = LOGS_DIR / name
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / f"{stamp}.log"
+
+    env = session_env(job)
+    timeout = int(job.get("timeoutSec") or 0) or None
+    argv = build_argv(job)
+
+    bump_revision()  # widget shows "running" as soon as the unit starts
+
+    timed_out = False
+    captured: list[str] = []
+    with log_path.open("w") as log:
+        log.write(f"# agentcron {name} started {iso(started)}\n")
+        log.write(f"# command: {' '.join(shlex.quote(part) for part in argv)}\n\n")
+        log.flush()
+        try:
+            process = subprocess.Popen(
+                argv,
+                cwd=job.get("cwd") or str(HOME),
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+        except OSError as exc:
+            log.write(f"failed to start: {exc}\n")
+            exit_code, output = 127, f"failed to start: {exc}"
+        else:
+            # Blocking readline() cannot observe the deadline while the child
+            # is silent, so poll the pipe instead and keep the timeout honest.
+            deadline = time.monotonic() + timeout if timeout else None
+            selector = selectors.DefaultSelector()
+            selector.register(process.stdout, selectors.EVENT_READ)
+            stream_open = True
+            while True:
+                if deadline is not None and time.monotonic() > deadline:
+                    timed_out = True
+                    kill_tree(process)
+                    break
+                wait_for = 0.25
+                if deadline is not None:
+                    wait_for = max(0.0, min(wait_for, deadline - time.monotonic()))
+                if stream_open and selector.select(timeout=wait_for):
+                    chunk = os.read(process.stdout.fileno(), 65536)
+                    if chunk:
+                        text = chunk.decode("utf-8", "replace")
+                        captured.append(text)
+                        log.write(text)
+                        log.flush()
+                        continue
+                    selector.unregister(process.stdout)
+                    stream_open = False
+                elif not stream_open:
+                    time.sleep(wait_for)
+                if process.poll() is not None and not stream_open:
+                    break
+            selector.close()
+            try:
+                exit_code = process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                kill_tree(process, hard=True)
+                exit_code = process.poll() if process.poll() is not None else -1
+            leftover = process.stdout.read() if not process.stdout.closed else b""
+            if leftover:
+                text = leftover.decode("utf-8", "replace")
+                captured.append(text)
+                log.write(text)
+            process.stdout.close()
+            output = "".join(captured)
+
+    ended = now()
+    duration = max(0, int((ended - started).total_seconds()))
+
+    if timed_out:
+        status = "failed"
+        summary = f"timed out after {timeout}s"
+    elif exit_code != 0:
+        status = "failed"
+        summary = f"exit {exit_code}: {tail_summary(output)}".strip()
+    else:
+        status, summary = "ok", tail_summary(output)
+        expect = job.get("expect")
+        if expect and not re.search(expect, output, re.MULTILINE):
+            status, summary = "attention", f"expect not matched: {expect}"
+        else:
+            ok, reason = run_verify(job, env)
+            if not ok:
+                status, summary = "attention", reason
+
+    record = {
+        "startedAt": iso(started),
+        "endedAt": iso(ended),
+        "status": status,
+        "exitCode": exit_code,
+        "durationSec": duration,
+        "logPath": str(log_path),
+        "summary": summary,
+        "hint": run_result_cmd(job, env),
+    }
+    append_run(name, record)
+    prune_logs(name)
+    bump_revision()
+
+    if status != "ok":
+        notify(
+            f"AgentCron: {name} {status}",
+            summary or "see log",
+            urgency="critical" if status == "failed" else "normal",
+        )
+    # The run record is the source of truth for job outcome, so the unit exits
+    # clean. A non-zero exit here would mean AgentCron itself broke.
+    return 0
+
+
+# ------------------------------------------------------------------------ commands
+
+
+def cmd_add(args: argparse.Namespace) -> int:
+    ensure_dirs()
+    name = args.name
+    if not NAME_RE.match(name):
+        raise Fail("job name must match [a-z0-9][a-z0-9_-]{0,31}")
+    if job_path(name).exists() and not args.force:
+        raise Fail(f"job {name} already exists (use --force to replace)")
+    if not args.shell and not args.run:
+        raise Fail("give a command with --shell '<line>' or --run <cmd> [args...]")
+    if args.shell and args.run:
+        raise Fail("--shell and --run are mutually exclusive")
+
+    validate_calendar(args.at)
+
+    env = {}
+    for item in args.env or []:
+        key, sep, value = item.partition("=")
+        if not sep or not key:
+            raise Fail(f"bad --env value {item!r}, expected KEY=VALUE")
+        env[key] = value
+
+    job = {
+        "name": name,
+        "description": args.desc or "",
+        "schedule": args.at,
+        "mode": "ask" if args.ask else "auto",
+        "persistent": not args.no_persistent,
+        "paused": False,
+        "cwd": str(Path(args.cwd).expanduser().resolve()) if args.cwd else str(Path.cwd()),
+        "env": env,
+        "path": os.environ.get("PATH", ""),
+        "timeoutSec": args.timeout if args.timeout is not None else DEFAULT_TIMEOUT_SEC,
+        "expect": args.expect,
+        "verify": args.verify,
+        "resultCmd": args.result_cmd,
+        "shell": args.shell,
+        "argv": list(args.run) if args.run else None,
+        "createdAt": iso(now()),
+    }
+    save_job(job)
+    write_units(job)
+    bump_revision()
+
+    nxt = timer_next_map().get(unit_base(name))
+    when = iso(dt.datetime.fromtimestamp(nxt).astimezone()) if nxt else "unknown"
+    print(f"added {name} ({job['mode']}), schedule {job['schedule']}, next run {when}")
+    return 0
+
+
+def cmd_edit(args: argparse.Namespace) -> int:
+    """Change one job in place. Units are rewritten every time, which also
+    repairs drift between the job file and the generated systemd units."""
+    job = load_job(args.name)
+    changed: list[str] = []
+
+    if args.shell is not None and args.run:
+        raise Fail("--shell and --run are mutually exclusive")
+
+    if args.at is not None:
+        validate_calendar(args.at)
+        job["schedule"] = args.at
+        changed.append("schedule")
+    if args.desc is not None:
+        job["description"] = args.desc
+        changed.append("description")
+    if args.timeout is not None:
+        job["timeoutSec"] = args.timeout
+        changed.append("timeoutSec")
+    if args.cwd is not None:
+        job["cwd"] = str(Path(args.cwd).expanduser().resolve())
+        changed.append("cwd")
+
+    # An empty string clears an optional gate: --expect '' drops the check.
+    for flag, field in (("expect", "expect"), ("verify", "verify"), ("result_cmd", "resultCmd")):
+        value = getattr(args, flag)
+        if value is not None:
+            job[field] = value or None
+            changed.append(field)
+
+    if args.env:
+        env = dict(job.get("env") or {})
+        for item in args.env:
+            key, sep, value = item.partition("=")
+            if not sep or not key:
+                raise Fail(f"bad --env value {item!r}, expected KEY=VALUE")
+            env[key] = value
+        job["env"] = env
+        changed.append("env")
+    if args.clear_env:
+        job["env"] = {}
+        changed.append("env")
+
+    if args.shell is not None:
+        job["shell"], job["argv"] = args.shell, None
+        changed.append("command")
+    if args.run:
+        job["argv"], job["shell"] = list(args.run), None
+        changed.append("command")
+
+    if args.ask:
+        job["mode"] = "ask"
+        changed.append("mode")
+    if args.auto:
+        job["mode"] = "auto"
+        changed.append("mode")
+    if args.persistent:
+        job["persistent"] = True
+        changed.append("persistent")
+    if args.no_persistent:
+        job["persistent"] = False
+        changed.append("persistent")
+    if args.refresh_path:
+        job["path"] = os.environ.get("PATH", "")
+        changed.append("path")
+
+    if not changed:
+        raise Fail("nothing to change; pass at least one field")
+
+    job["editedAt"] = iso(now())
+    save_job(job)
+    write_units(job)
+    bump_revision()
+
+    nxt = timer_next_map().get(unit_base(job["name"]))
+    when = iso(dt.datetime.fromtimestamp(nxt).astimezone()) if nxt else "paused"
+    print(f"edited {job['name']}: {', '.join(sorted(set(changed)))}; next run {when}")
+    return 0
+
+
+def cmd_rm(args: argparse.Namespace) -> int:
+    job = load_job(args.name)
+    remove_units(job["name"])
+    job_path(job["name"]).unlink(missing_ok=True)
+    pending_path(job["name"]).unlink(missing_ok=True)
+    approval_path(job["name"]).unlink(missing_ok=True)
+    bump_revision()
+    print(f"removed {job['name']} (logs and run history kept under {STATE_DIR})")
+    return 0
+
+
+def cmd_pause(args: argparse.Namespace) -> int:
+    job = load_job(args.name)
+    job["paused"] = True
+    save_job(job)
+    systemctl("disable", "--now", f"{unit_base(job['name'])}.timer")
+    bump_revision()
+    print(f"paused {job['name']}")
+    return 0
+
+
+def cmd_resume(args: argparse.Namespace) -> int:
+    job = load_job(args.name)
+    job["paused"] = False
+    save_job(job)
+    write_units(job)
+    bump_revision()
+    print(f"resumed {job['name']}")
+    return 0
+
+
+def cmd_run(args: argparse.Namespace) -> int:
+    job = load_job(args.name)
+    approval_path(job["name"]).write_text(
+        json.dumps({"approvedAt": iso(now()), "source": "manual"}) + "\n"
+    )
+    result = systemctl("start", "--no-block", f"{unit_base(job['name'])}.service")
+    if result.returncode != 0:
+        approval_path(job["name"]).unlink(missing_ok=True)
+        raise Fail(result.stderr.strip() or "systemctl start failed")
+    bump_revision()
+    print(f"started {job['name']}")
+    return 0
+
+
+def cmd_approve(args: argparse.Namespace) -> int:
+    job = load_job(args.name)
+    if not read_pending(job["name"]):
+        raise Fail(f"{job['name']} has no pending request")
+    pending_path(job["name"]).unlink(missing_ok=True)
+    return cmd_run(args)
+
+
+def cmd_skip(args: argparse.Namespace) -> int:
+    job = load_job(args.name)
+    if not read_pending(job["name"]):
+        raise Fail(f"{job['name']} has no pending request")
+    pending_path(job["name"]).unlink(missing_ok=True)
+    bump_revision()
+    print(f"skipped this run of {job['name']}")
+    return 0
+
+
+def humanize(target_iso: str | None) -> str:
+    if not target_iso:
+        return "-"
+    try:
+        target = dt.datetime.fromisoformat(target_iso)
+    except ValueError:
+        return target_iso
+    delta = int((target - now()).total_seconds())
+    if delta < 0:
+        return "due"
+    if delta < 3600:
+        return f"in {delta // 60}m"
+    if delta < 86400:
+        return f"in {delta // 3600}h"
+    return f"in {delta // 86400}d"
+
+
+def cmd_list(args: argparse.Namespace) -> int:
+    status = build_status()
+    if args.json:
+        print(json.dumps(status, ensure_ascii=False, indent=2))
+        return 0
+    if not status["jobs"]:
+        print("no jobs. create one with: agentcron add <name> --at '<OnCalendar>' --shell '<cmd>'")
+        return 0
+    width = max(len(job["name"]) for job in status["jobs"])
+    for job in status["jobs"]:
+        last = job["lastRun"]
+        last_text = f"{last['status']} {last['durationSec']}s" if last else "never run"
+        print(
+            f"{job['name']:<{width}}  {job['state']:<9}  next {humanize(job['nextRunAt']):<7}"
+            f"  {job['schedule']:<18}  last: {last_text}"
+        )
+    return 0
+
+
+def cmd_show(args: argparse.Namespace) -> int:
+    job = load_job(args.name)
+    status = build_status()
+    view = next((item for item in status["jobs"] if item["name"] == job["name"]), None)
+    print(json.dumps({"job": job, "status": view}, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    status = build_status()
+    if args.json:
+        print(json.dumps(status, ensure_ascii=False))
+        return 0
+    summary = status["summary"]
+    print(
+        f"{summary['total']} jobs, {summary['active']} active, {summary['paused']} paused, "
+        f"{summary['failed']} failed, {summary['waiting']} waiting"
+    )
+    if summary["nextJob"]:
+        print(f"next: {summary['nextJob']} {humanize(summary['nextRunAt'])}")
+    return 0
+
+
+def cmd_log(args: argparse.Namespace) -> int:
+    job = load_job(args.name)
+    history = read_runs(job["name"], limit=HISTORY_LIMIT)
+    if not history:
+        print("no runs yet")
+        return 0
+    record = history[-1]
+    path = Path(record.get("logPath", ""))
+    if args.path:
+        print(path)
+        return 0
+    print(f"# {record['startedAt']} {record['status']} exit={record['exitCode']} {path}")
+    if path.is_file():
+        text = path.read_text()
+        lines = text.splitlines()
+        print("\n".join(lines[-args.lines :]))
+    return 0
+
+
+def cmd_doctor(_: argparse.Namespace) -> int:
+    ensure_dirs()
+    problems = 0
+
+    if subprocess.run(["systemctl", "--user", "is-system-running"], capture_output=True).returncode > 3:
+        print("FAIL user systemd manager is not reachable")
+        problems += 1
+    else:
+        print("ok   user systemd manager reachable")
+
+    linger = subprocess.run(
+        ["loginctl", "show-user", os.environ.get("USER", ""), "-p", "Linger", "--value"],
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    if linger == "yes":
+        print("ok   linger enabled (timers fire without an active login)")
+    else:
+        print("warn linger disabled: timers only fire while you are logged in")
+        print("     fix: sudo loginctl enable-linger $USER")
+
+    for job in all_jobs():
+        base = unit_base(job["name"])
+        for suffix in (".service", ".timer"):
+            path = UNIT_DIR / f"{base}{suffix}"
+            if not path.is_file():
+                print(f"FAIL {job['name']}: missing {path.name}")
+                problems += 1
+        active = systemctl("is-enabled", f"{base}.timer").stdout.strip()
+        if job.get("paused"):
+            if active == "enabled":
+                print(f"warn {job['name']}: paused but timer still enabled")
+        elif active != "enabled":
+            print(f"FAIL {job['name']}: timer not enabled ({active or 'unknown'})")
+            problems += 1
+        command = job.get("argv")[0] if job.get("argv") else None
+        if command and not shutil.which(command, path=job.get("path") or os.environ.get("PATH", "")):
+            print(f"warn {job['name']}: {command} not found in the job's captured PATH")
+
+    print("no problems found" if problems == 0 else f"{problems} problem(s) found")
+    return 0 if problems == 0 else 1
+
+
+# ---------------------------------------------------------------------------- cli
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="agentcron",
+        description="Scheduled agent jobs for Omarchy, backed by systemd user timers.",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    add = sub.add_parser("add", help="create a job")
+    add.add_argument("name")
+    add.add_argument("--at", required=True, metavar="ONCALENDAR",
+                     help="systemd OnCalendar expression, e.g. 'Mon..Fri 08:30' or '*:0/15'")
+    add.add_argument("--desc", default="")
+    add.add_argument("--ask", action="store_true",
+                     help="ask for approval instead of running unattended")
+    add.add_argument("--cwd")
+    add.add_argument("--env", action="append", metavar="KEY=VALUE")
+    add.add_argument("--timeout", type=int, metavar="SEC",
+                     help=f"kill the run after SEC seconds (default {DEFAULT_TIMEOUT_SEC}, 0 disables)")
+    add.add_argument("--expect", metavar="REGEX",
+                     help="mark the run 'attention' when output does not match REGEX")
+    add.add_argument("--verify", metavar="SHELL",
+                     help="after a zero exit, run this command; non-zero marks the run 'attention'")
+    add.add_argument("--result-cmd", metavar="SHELL",
+                     help="after the run, print one line the panel offers for copying "
+                          "(e.g. an artifact path or the agent's resume command)")
+    add.add_argument("--no-persistent", action="store_true",
+                     help="do not catch up a run missed while the machine was off")
+    add.add_argument("--force", action="store_true")
+    add.add_argument("--shell", metavar="LINE", help="command line interpreted by bash -c")
+    add.add_argument("--run", nargs=argparse.REMAINDER, metavar="CMD",
+                     help="command and arguments, no shell; must come last")
+    add.set_defaults(func=cmd_add)
+
+    edit = sub.add_parser("edit", help="change fields of an existing job")
+    edit.add_argument("name")
+    edit.add_argument("--at", metavar="ONCALENDAR", help="new OnCalendar expression")
+    edit.add_argument("--desc")
+    edit.add_argument("--cwd")
+    edit.add_argument("--env", action="append", metavar="KEY=VALUE",
+                      help="set or override one variable; repeatable")
+    edit.add_argument("--clear-env", action="store_true", help="drop every job variable first")
+    edit.add_argument("--timeout", type=int, metavar="SEC")
+    edit.add_argument("--expect", metavar="REGEX", help="empty string clears the check")
+    edit.add_argument("--verify", metavar="SHELL", help="empty string clears the check")
+    edit.add_argument("--result-cmd", metavar="SHELL", help="empty string clears it")
+    edit.add_argument("--ask", action="store_true", help="switch to approval mode")
+    edit.add_argument("--auto", action="store_true", help="switch to unattended mode")
+    edit.add_argument("--persistent", action="store_true", help="catch up missed runs")
+    edit.add_argument("--no-persistent", action="store_true", help="skip missed runs")
+    edit.add_argument("--refresh-path", action="store_true",
+                      help="recapture PATH from the current shell")
+    edit.add_argument("--shell", metavar="LINE")
+    edit.add_argument("--run", nargs=argparse.REMAINDER, metavar="CMD",
+                      help="command and arguments, no shell; must come last")
+    edit.set_defaults(func=cmd_edit)
+
+    for name, handler, help_text in (
+        ("rm", cmd_rm, "delete a job and its units"),
+        ("pause", cmd_pause, "stop scheduling a job"),
+        ("resume", cmd_resume, "resume a paused job"),
+        ("run", cmd_run, "run a job now"),
+        ("approve", cmd_approve, "approve a waiting ask-mode run"),
+        ("skip", cmd_skip, "decline a waiting ask-mode run"),
+        ("show", cmd_show, "print one job as JSON"),
+    ):
+        node = sub.add_parser(name, help=help_text)
+        node.add_argument("name")
+        node.set_defaults(func=handler)
+
+    listing = sub.add_parser("list", help="list jobs")
+    listing.add_argument("--json", action="store_true")
+    listing.set_defaults(func=cmd_list)
+
+    status = sub.add_parser("status", help="summary, or the full widget contract with --json")
+    status.add_argument("--json", action="store_true")
+    status.set_defaults(func=cmd_status)
+
+    log = sub.add_parser("log", help="show the last run's output")
+    log.add_argument("name")
+    log.add_argument("-n", "--lines", type=int, default=60)
+    log.add_argument("--path", action="store_true", help="print the log path only")
+    log.set_defaults(func=cmd_log)
+
+    doctor = sub.add_parser("doctor", help="check the install and every job")
+    doctor.set_defaults(func=cmd_doctor)
+
+    internal = sub.add_parser("internal-run", help="(internal) execute a job, called by systemd")
+    internal.add_argument("name")
+    internal.set_defaults(func=lambda args: internal_run(args.name))
+
+    return parser
+
+
+def main(argv: list[str]) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        return args.func(args)
+    except Fail as exc:
+        print(f"agentcron: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
