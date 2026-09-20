@@ -64,7 +64,7 @@ agentcron add backup --at 'Mon..Fri 02:00' --desc 'Nightly restic backup' \
   --shell 'restic backup ~/Documents'
 
 # ask first: posts a notification and runs nothing until you approve it
-agentcron add upgrade --at 'Sun 09:00' --ask --shell 'paru -Syu --noconfirm'
+agentcron add digest --at 'Mon 09:00' --ask --shell 'mail -s weekly team@example.org < ~/digest.txt'
 ```
 
 Schedules are systemd `OnCalendar` expressions, validated with
