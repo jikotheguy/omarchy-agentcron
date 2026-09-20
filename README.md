@@ -35,6 +35,28 @@ For jobs that must run while you are logged out:
 sudo loginctl enable-linger $USER
 ```
 
+### Dependencies
+
+Everything ships with Omarchy: `python3` for the CLI, the systemd user manager
+and `systemd-analyze` for timers, `wl-copy` for the Copy button, and
+`omarchy-notification-send` (falling back to `notify-send`) for
+notifications. Nothing is downloaded at install or run time.
+
+### Remove
+
+```bash
+agentcron list                                   # then rm each job
+agentcron rm <name>                              # deletes its systemd units
+~/.config/omarchy/plugins/jikotheguy.agentcron/install.sh --uninstall
+omarchy plugin remove jikotheguy.agentcron
+```
+
+Removing a job keeps its logs and run history under
+`~/.local/state/agentcron/`. Delete that directory and `~/.config/agentcron/`
+if you want nothing left behind. The plugin never writes outside those two
+directories, `~/.config/systemd/user/agentcron-*`, and the `~/.local/bin`
+symlink.
+
 ## Create a job
 
 ```bash
