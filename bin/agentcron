@@ -42,6 +42,19 @@ HISTORY_LIMIT = 7
 LOG_KEEP = 20
 DEFAULT_TIMEOUT_SEC = 3600
 
+# Output ceilings. A scheduled command is unattended: if it prints forever it
+# must die on its own, long before the timeout. Capture stops at
+# OUTPUT_LIMIT_BYTES and kills the child's whole process group, only the last
+# OUTPUT_TAIL_BYTES stay in memory, and the log file is capped independently,
+# so one job costs at most LOG_KEEP * LOG_LIMIT_BYTES on disk.
+READ_CHUNK = 65536
+OUTPUT_LIMIT_BYTES = 1 << 20
+OUTPUT_TAIL_BYTES = 64 << 10
+LOG_LIMIT_BYTES = 1 << 20
+HELPER_OUTPUT_LIMIT_BYTES = 256 << 10
+VERIFY_TIMEOUT_SEC = 300
+RESULT_CMD_TIMEOUT_SEC = 60
+
 # Session variables a desktop agent job usually needs; imported from the user
 # manager when the unit environment does not already carry them.
 SESSION_ENV_KEYS = (
@@ -468,6 +481,147 @@ def kill_tree(process: subprocess.Popen, hard: bool = False) -> None:
             pass
 
 
+class Tail:
+    """Bounded tail of a byte stream: counts every byte, keeps only the end."""
+
+    def __init__(self, limit: int) -> None:
+        self.limit = limit
+        self.total = 0
+        self._chunks: list[bytes] = []
+        self._size = 0
+
+    def feed(self, chunk: bytes) -> None:
+        self.total += len(chunk)
+        self._chunks.append(chunk)
+        self._size += len(chunk)
+        while self._size > self.limit and self._chunks:
+            excess = self._size - self.limit
+            head = self._chunks[0]
+            if len(head) <= excess:
+                self._chunks.pop(0)
+                self._size -= len(head)
+            else:
+                self._chunks[0] = head[excess:]
+                self._size -= excess
+
+    def text(self) -> str:
+        # A tail can start mid-character, so decoding must never raise.
+        return b"".join(self._chunks).decode("utf-8", "replace")
+
+
+class CappedLog:
+    """Log writer with a hard byte ceiling. Nothing past it is kept anywhere."""
+
+    def __init__(self, handle, limit: int) -> None:
+        self.handle = handle
+        self.limit = limit
+        self.written = 0
+        self.capped = False
+
+    def write(self, data: bytes) -> None:
+        if self.capped or not data:
+            return
+        room = self.limit - self.written
+        if len(data) >= room:
+            self.handle.write(data[:room])
+            self.written += room
+            self.handle.write(f"\n# log capped at {self.limit} bytes\n".encode())
+            self.capped = True
+            return
+        self.handle.write(data)
+        self.written += len(data)
+
+    def note(self, line: str) -> None:
+        self.write(line.encode())
+
+    def flush(self) -> None:
+        self.handle.flush()
+
+
+def pump(
+    process: subprocess.Popen,
+    tail: Tail,
+    log: CappedLog | None,
+    limit: int,
+    timeout: int | None,
+) -> tuple[int, bool, bool]:
+    """Stream a child's output under a byte ceiling and a deadline.
+
+    Returns (exit code, timed out, over limit). Crossing either ceiling kills
+    the whole process group, so a runaway job cannot fill memory or the disk
+    while its timeout is still running.
+    """
+    fd = process.stdout.fileno()
+    # Blocking readline() cannot observe the deadline while the child is
+    # silent, so poll the pipe instead and keep the timeout honest.
+    deadline = time.monotonic() + timeout if timeout else None
+    timed_out = False
+    over_limit = False
+    selector = selectors.DefaultSelector()
+    selector.register(process.stdout, selectors.EVENT_READ)
+    stream_open = True
+    while True:
+        if deadline is not None and time.monotonic() > deadline:
+            timed_out = True
+            kill_tree(process)
+            break
+        wait_for = 0.25
+        if deadline is not None:
+            wait_for = max(0.0, min(wait_for, deadline - time.monotonic()))
+        if stream_open and selector.select(timeout=wait_for):
+            chunk = os.read(fd, READ_CHUNK)
+            if chunk:
+                tail.feed(chunk)
+                if log is not None:
+                    log.write(chunk)
+                    log.flush()
+                if tail.total > limit:
+                    over_limit = True
+                    if log is not None:
+                        log.note(f"\n# output limit of {limit} bytes reached\n")
+                    kill_tree(process)
+                    break
+                continue
+            selector.unregister(process.stdout)
+            stream_open = False
+        elif not stream_open:
+            time.sleep(wait_for)
+        if process.poll() is not None and not stream_open:
+            break
+    selector.close()
+    try:
+        exit_code = process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        kill_tree(process, hard=True)
+        try:
+            exit_code = process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            exit_code = process.poll() if process.poll() is not None else -1
+    if not over_limit and not process.stdout.closed:
+        # Whatever is still in the pipe, read without blocking on a grandchild
+        # that inherited it, and still under the same ceiling.
+        os.set_blocking(fd, False)
+        while True:
+            try:
+                chunk = os.read(fd, READ_CHUNK)
+            except OSError:  # BlockingIOError included: nothing more to read
+                break
+            if not chunk:
+                break
+            tail.feed(chunk)
+            if log is not None:
+                log.write(chunk)
+            if tail.total > limit:
+                over_limit = True
+                if log is not None:
+                    log.note(f"\n# output limit of {limit} bytes reached\n")
+                kill_tree(process)
+                break
+    if not process.stdout.closed:
+        process.stdout.close()
+    return exit_code, timed_out, over_limit
+
+
 def tail_summary(text: str, limit: int = 160) -> str:
     for line in reversed(text.strip().splitlines()):
         line = line.strip()
@@ -488,21 +642,48 @@ def prune_logs(name: str) -> None:
             pass
 
 
+def run_capped(
+    command: str,
+    job: dict,
+    env: dict[str, str],
+    timeout: int,
+) -> tuple[int, str, bool, bool]:
+    """Run a helper shell line under the same ceilings as the job itself.
+
+    Returns (exit code, output tail, timed out, over limit).
+    """
+    try:
+        process = subprocess.Popen(
+            ["bash", "-c", command],
+            cwd=job.get("cwd") or str(HOME),
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    except OSError as exc:
+        return 127, f"failed to start: {exc}", False, False
+    tail = Tail(OUTPUT_TAIL_BYTES)
+    exit_code, timed_out, over_limit = pump(
+        process, tail, None, HELPER_OUTPUT_LIMIT_BYTES, timeout
+    )
+    return exit_code, tail.text(), timed_out, over_limit
+
+
 def run_verify(job: dict, env: dict[str, str]) -> tuple[bool, str]:
     verify = job.get("verify")
     if not verify:
         return True, ""
-    result = subprocess.run(
-        ["bash", "-c", verify],
-        cwd=job.get("cwd") or str(HOME),
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=300,
+    exit_code, output, timed_out, over_limit = run_capped(
+        verify, job, env, VERIFY_TIMEOUT_SEC
     )
-    if result.returncode == 0:
+    if timed_out:
+        return False, f"verify timed out after {VERIFY_TIMEOUT_SEC}s"
+    if over_limit:
+        return False, f"verify killed after {HELPER_OUTPUT_LIMIT_BYTES} bytes of output"
+    if exit_code == 0:
         return True, ""
-    return False, f"verify failed (exit {result.returncode}): {tail_summary(result.stdout + result.stderr)}"
+    return False, f"verify failed (exit {exit_code}): {tail_summary(output)}"
 
 
 def run_result_cmd(job: dict, env: dict[str, str]) -> str:
@@ -514,20 +695,12 @@ def run_result_cmd(job: dict, env: dict[str, str]) -> str:
     command = job.get("resultCmd")
     if not command:
         return ""
-    try:
-        result = subprocess.run(
-            ["bash", "-c", command],
-            cwd=job.get("cwd") or str(HOME),
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=60,
-        )
-    except subprocess.TimeoutExpired:
+    exit_code, output, timed_out, over_limit = run_capped(
+        command, job, env, RESULT_CMD_TIMEOUT_SEC
+    )
+    if exit_code != 0 or timed_out or over_limit:
         return ""
-    if result.returncode != 0:
-        return ""
-    for line in result.stdout.splitlines():
+    for line in output.splitlines():
         line = line.strip()
         if line:
             return line[:300]
@@ -576,10 +749,12 @@ def internal_run(name: str) -> int:
     bump_revision()  # widget shows "running" as soon as the unit starts
 
     timed_out = False
-    captured: list[str] = []
-    with log_path.open("w") as log:
-        log.write(f"# agentcron {name} started {iso(started)}\n")
-        log.write(f"# command: {' '.join(shlex.quote(part) for part in argv)}\n\n")
+    over_limit = False
+    tail = Tail(OUTPUT_TAIL_BYTES)
+    with log_path.open("wb") as handle:
+        log = CappedLog(handle, LOG_LIMIT_BYTES)
+        log.note(f"# agentcron {name} started {iso(started)}\n")
+        log.note(f"# command: {' '.join(shlex.quote(part) for part in argv)}\n\n")
         log.flush()
         try:
             process = subprocess.Popen(
@@ -591,50 +766,13 @@ def internal_run(name: str) -> int:
                 start_new_session=True,
             )
         except OSError as exc:
-            log.write(f"failed to start: {exc}\n")
+            log.note(f"failed to start: {exc}\n")
             exit_code, output = 127, f"failed to start: {exc}"
         else:
-            # Blocking readline() cannot observe the deadline while the child
-            # is silent, so poll the pipe instead and keep the timeout honest.
-            deadline = time.monotonic() + timeout if timeout else None
-            selector = selectors.DefaultSelector()
-            selector.register(process.stdout, selectors.EVENT_READ)
-            stream_open = True
-            while True:
-                if deadline is not None and time.monotonic() > deadline:
-                    timed_out = True
-                    kill_tree(process)
-                    break
-                wait_for = 0.25
-                if deadline is not None:
-                    wait_for = max(0.0, min(wait_for, deadline - time.monotonic()))
-                if stream_open and selector.select(timeout=wait_for):
-                    chunk = os.read(process.stdout.fileno(), 65536)
-                    if chunk:
-                        text = chunk.decode("utf-8", "replace")
-                        captured.append(text)
-                        log.write(text)
-                        log.flush()
-                        continue
-                    selector.unregister(process.stdout)
-                    stream_open = False
-                elif not stream_open:
-                    time.sleep(wait_for)
-                if process.poll() is not None and not stream_open:
-                    break
-            selector.close()
-            try:
-                exit_code = process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                kill_tree(process, hard=True)
-                exit_code = process.poll() if process.poll() is not None else -1
-            leftover = process.stdout.read() if not process.stdout.closed else b""
-            if leftover:
-                text = leftover.decode("utf-8", "replace")
-                captured.append(text)
-                log.write(text)
-            process.stdout.close()
-            output = "".join(captured)
+            exit_code, timed_out, over_limit = pump(
+                process, tail, log, OUTPUT_LIMIT_BYTES, timeout
+            )
+            output = tail.text()
 
     ended = now()
     duration = max(0, int((ended - started).total_seconds()))
@@ -642,6 +780,9 @@ def internal_run(name: str) -> int:
     if timed_out:
         status = "failed"
         summary = f"timed out after {timeout}s"
+    elif over_limit:
+        status = "failed"
+        summary = f"killed after {OUTPUT_LIMIT_BYTES} bytes of output"
     elif exit_code != 0:
         status = "failed"
         summary = f"exit {exit_code}: {tail_summary(output)}".strip()

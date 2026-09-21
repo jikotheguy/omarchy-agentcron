@@ -95,6 +95,7 @@ agentcron add digest --at 'Mon..Fri 08:30' \
 ```
 
 - `--expect REGEX` — the run's output must match, or the run is `attention`.
+  It is matched against the last 64 KiB of output, so keep the status line last.
 - `--verify SHELL` — after a zero exit, this command must also exit zero.
 
 Have the job print one literal status line as its last line and match that:
@@ -106,7 +107,7 @@ it becomes both the panel's summary and the `--expect` target.
 |---|---|
 | `ok` | last run succeeded and passed its gates |
 | `attention` | ran, exited zero, but `--expect` or `--verify` did not pass |
-| `failed` | non-zero exit, or killed by `--timeout` |
+| `failed` | non-zero exit, killed by `--timeout`, or killed for exceeding the output limit |
 | `waiting` | an `--ask` job is waiting for approval |
 | `running` | executing now |
 | `paused` | scheduling disabled, definition kept |
@@ -173,7 +174,7 @@ sentence instead of a man page.
 | `~/.config/agentcron/jobs/<name>.json` | job definition, including the `PATH` captured at creation |
 | `~/.config/systemd/user/agentcron-<name>.{service,timer}` | generated units — never hand-edit |
 | `~/.local/state/agentcron/runs/<name>.jsonl` | one line per run: times, status, exit code, log path, summary |
-| `~/.local/state/agentcron/logs/<name>/<ts>.log` | captured output, newest 20 kept |
+| `~/.local/state/agentcron/logs/<name>/<ts>.log` | captured output, capped at 1 MiB, newest 20 kept |
 | `~/.local/state/agentcron/pending/<name>.json` | a waiting approval request |
 | `~/.local/state/agentcron/revision` | bumped on every change; the widget watches it |
 
@@ -194,6 +195,11 @@ failed `agentcron-*` unit therefore means AgentCron itself broke — run
   nothing here wakes a suspended machine.
 - One run per job at a time: systemd will not start a second copy while the
   service is active.
+- Output is capped by bytes, not trusted to the timeout: capture and the log
+  file both stop at 1 MiB, only the last 64 KiB are kept for the summary and
+  `--expect`, and `--verify` and `--result-cmd` stop at 256 KiB each. Crossing
+  a ceiling kills the command's whole process group and marks the run
+  `failed`, so a runaway job costs at most 20 MiB of logs.
 - `--ask` requests are answered from the panel or the CLI, not from the
   notification itself.
 

@@ -53,7 +53,8 @@ Rules that matter when nobody is watching:
 - State in the prompt that the run is unattended and must never ask a
   question or wait for confirmation.
 - Require one literal status line as the **last line** of the reply. It
-  becomes both the panel's summary and the `--expect` target.
+  becomes both the panel's summary and the `--expect` target, and only the
+  last 64 KiB of output is matched against `--expect`.
 - Never let an unattended run write the clipboard. Write a file, then notify.
 - Give every agent job at least `--expect`. An agent can exit 0 having done
   nothing at all.
@@ -72,7 +73,7 @@ Rules that matter when nobody is watching:
 |---|---|
 | `ok` | zero exit and every gate passed |
 | `attention` | zero exit but `--expect` did not match, or `--verify` failed |
-| `failed` | non-zero exit, or killed by `--timeout` |
+| `failed` | non-zero exit, killed by `--timeout`, or killed for exceeding the output limit |
 | `waiting` | an `--ask` job is waiting for approval |
 | `running` / `paused` / `never` | self-evident |
 
@@ -96,7 +97,7 @@ until the user clicks.
 | `~/.config/agentcron/jobs/<name>.json` | job definition, including the `PATH` captured at creation |
 | `~/.config/systemd/user/agentcron-<name>.{service,timer}` | generated units, never hand-edit |
 | `~/.local/state/agentcron/runs/<name>.jsonl` | one JSON line per run |
-| `~/.local/state/agentcron/logs/<name>/<ts>.log` | captured output, newest 20 kept |
+| `~/.local/state/agentcron/logs/<name>/<ts>.log` | captured output, capped at 1 MiB, newest 20 kept |
 | `~/.local/state/agentcron/revision` | bumped on every change; the widget watches it |
 
 ## Limits
@@ -106,5 +107,9 @@ until the user clicks.
 - User timers need `loginctl enable-linger` to fire while logged out, and
   nothing here wakes a suspended machine.
 - One run per job at a time; systemd will not start a second copy.
+- Output is capped by bytes: 1 MiB for the command and its log file, 256 KiB
+  for `--verify` and `--result-cmd`, with only the last 64 KiB kept in memory.
+  Crossing a ceiling kills the whole process group and fails the run, so a job
+  that prints in a loop is stopped instead of filling memory and disk.
 - `Persistent=true` catches up one missed run after boot unless
   `--no-persistent`.

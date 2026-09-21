@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "jikotheguy.agentcron",
   "name": "AgentCron",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "author": "jikotheguy",
   "license": "MIT",
   "description": "Scheduled agent jobs on systemd user timers, with run history and approval in the bar.",
