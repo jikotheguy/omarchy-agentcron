@@ -335,6 +335,26 @@ def active_services() -> set[str]:
     return running
 
 
+def schedules_without_next(exprs: set[str]) -> set[str]:
+    """Calendar expressions that never elapse again, e.g. a one-shot date in the past."""
+    ordered = sorted(exprs)
+    if not ordered:
+        return set()
+    result = subprocess.run(
+        ["systemd-analyze", "calendar", "--", *ordered], capture_output=True, text=True
+    )
+    if result.returncode != 0:
+        return set()
+    nexts = [
+        line.split(":", 1)[1].strip()
+        for line in result.stdout.splitlines()
+        if line.strip().startswith("Next elapse:")
+    ]
+    if len(nexts) != len(ordered):
+        return set()
+    return {expr for expr, nxt in zip(ordered, nexts) if nxt == "never"}
+
+
 # ------------------------------------------------------------------------- status
 
 
@@ -382,11 +402,18 @@ def build_status() -> dict:
         "attention": 0,
         "waiting": 0,
         "running": 0,
+        "expired": 0,
     }
+    jobs = all_jobs()
+    # A timer with no next elapse is either paused, broken, or done for good;
+    # only the schedule itself tells the last case apart.
+    finished = schedules_without_next(
+        {job["schedule"] for job in jobs if unit_base(job["name"]) not in next_map}
+    )
     next_job = None
     next_at = None
 
-    for job in all_jobs():
+    for job in jobs:
         name = job["name"]
         base = unit_base(name)
         history = read_runs(name)
@@ -394,6 +421,7 @@ def build_status() -> dict:
         pending = read_pending(name)
         running = base in running_set
         state = job_state(job, running, pending, last)
+        expired = job["schedule"] in finished and not running and not pending
 
         epoch = next_map.get(base)
         next_run = (
@@ -409,6 +437,8 @@ def build_status() -> dict:
         for key in ("failed", "attention", "waiting", "running"):
             if state == key:
                 counters[key] += 1
+        if expired:
+            counters["expired"] += 1
 
         jobs_out.append(
             {
@@ -419,6 +449,7 @@ def build_status() -> dict:
                 "paused": bool(job.get("paused")),
                 "running": running,
                 "nextRunAt": next_run,
+                "expired": expired,
                 "state": state,
                 "pending": {"requestedAt": pending["requestedAt"]} if pending else None,
                 "lastRun": last,

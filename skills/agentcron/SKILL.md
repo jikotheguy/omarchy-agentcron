@@ -77,6 +77,10 @@ Rules that matter when nobody is watching:
 | `waiting` | an `--ask` job is waiting for approval |
 | `running` / `paused` / `never` | self-evident |
 
+`expired` is a separate boolean, not a state: the schedule never elapses again
+(a past one-shot date). Expired jobs stay until removed; the panel lists them
+under its Expired tab with a Remove button, or run `agentcron rm <name>`.
+
 A job's failure never fails its unit: the runner records the outcome and exits
 0. An `agentcron-*` unit in `systemctl --user --failed` means AgentCron itself
 broke — run `agentcron doctor`.

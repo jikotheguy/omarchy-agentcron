@@ -16,6 +16,13 @@ Panel {
   property int selectedIndex: 0
   property bool cursorActive: false
   property double nowMs: Date.now()
+  // "active" or "expired": expired jobs have a schedule that never elapses again.
+  property string jobTab: "active"
+  // Name of the job whose Remove is armed; a second press removes it.
+  property string confirmRemove: ""
+  readonly property var visibleJobs: jobsForTab(jobTab)
+  readonly property int activeCount: jobsForTab("active").length
+  readonly property int expiredCount: jobsForTab("expired").length
 
   readonly property color foreground: bar ? bar.foreground : Color.foreground
   readonly property color urgent: bar ? bar.urgent : Color.urgent
@@ -47,26 +54,42 @@ Panel {
     return foreground
   }
 
+  function jobsForTab(tab) {
+    var wantExpired = tab === "expired"
+    return cron.jobs.filter(function(job) { return job.expired === wantExpired })
+  }
+
   function selectedJob() {
-    if (cron.jobs.length === 0) return null
-    return cron.jobs[Math.max(0, Math.min(selectedIndex, cron.jobs.length - 1))]
+    var jobs = jobsForTab(jobTab)
+    if (jobs.length === 0) return null
+    return jobs[Math.max(0, Math.min(selectedIndex, jobs.length - 1))]
   }
 
   function ensureCursor() {
-    if (cron.jobs.length === 0) {
+    var count = jobsForTab(jobTab).length
+    if (count === 0) {
       selectedIndex = 0
       return
     }
-    if (selectedIndex >= cron.jobs.length) selectedIndex = cron.jobs.length - 1
+    if (selectedIndex >= count) selectedIndex = count - 1
     if (selectedIndex < 0) selectedIndex = 0
   }
 
   function moveCursor(dx, dy) {
     cursorActive = true
     ensureCursor()
-    if (dy === 0 || cron.jobs.length === 0) return
-    selectedIndex = Math.max(0, Math.min(cron.jobs.length - 1, selectedIndex + dy))
+    var count = jobsForTab(jobTab).length
+    if (dy === 0 || count === 0) return
+    selectedIndex = Math.max(0, Math.min(count - 1, selectedIndex + dy))
     scrollCursorIntoView()
+  }
+
+  function setJobTab(tab) {
+    if (tab === jobTab) return
+    jobTab = tab
+    confirmRemove = ""
+    selectedIndex = 0
+    if (panelFlick) panelFlick.contentY = 0
   }
 
   function setJobCursor(index) {
@@ -76,6 +99,10 @@ Panel {
   }
 
   function activateCursor() {
+    if (confirmRemove !== "") {
+      removeConfirmed()
+      return
+    }
     ensureCursor()
     cursorActive = true
   }
@@ -92,9 +119,29 @@ Panel {
 
   function togglePauseSelected() {
     var job = selectedJob()
-    if (!job) return
+    if (!job || job.expired) return
     if (job.paused) cron.resume(job.name)
     else cron.pause(job.name)
+  }
+
+  function requestRemove(job) {
+    if (!job || job.running) return
+    if (confirmRemove === job.name) removeConfirmed()
+    else confirmRemove = job.name
+  }
+
+  function requestRemoveSelected() {
+    if (cursorActive) requestRemove(selectedJob())
+  }
+
+  function removeConfirmed() {
+    var name = confirmRemove
+    confirmRemove = ""
+    if (name !== "") cron.remove(name)
+  }
+
+  function cancelRemove() {
+    confirmRemove = ""
   }
 
   function scrollItemIntoView(item) {
@@ -120,12 +167,16 @@ Panel {
 
   onOpenedChanged: if (opened) {
     cursorActive = false
+    confirmRemove = ""
     nowMs = Date.now()
     if (panelFlick) panelFlick.contentY = 0
     cron.refresh()
     Qt.callLater(function() { keyCatcher.forceActiveFocus() })
   }
-  onSelectedIndexChanged: scrollCursorIntoView()
+  onSelectedIndexChanged: {
+    confirmRemove = ""
+    scrollCursorIntoView()
+  }
   onWorstStateChanged: if (worstState !== "running") iconPulse = 1.0
 
   Service {
@@ -221,11 +272,16 @@ Panel {
       id: keyCatcher
       anchors.fill: parent
       onMoveRequested: function(dx, dy) {
+        if (dx !== 0) { root.setJobTab(dx > 0 ? "expired" : "active"); return }
         if (!root.cursorActive) { root.cursorActive = true; return }
         root.moveCursor(dx, dy)
       }
       onActivateRequested: if (root.cursorActive) root.activateCursor()
-      onCloseRequested: root.close()
+      onCloseRequested: {
+        if (root.confirmRemove !== "") root.cancelRemove()
+        else root.close()
+      }
+      onDeleteRequested: root.requestRemoveSelected()
       onTabRequested: function(direction) { root.switchPanel(direction) }
       onTextKey: function(t) {
         if (t === "r" || t === "R") root.runSelected()
@@ -298,10 +354,32 @@ Panel {
             width: parent.width
             spacing: Style.space(10)
 
-            PanelSectionHeader {
-              text: "JOBS"
+            ButtonGroup {
+              options: [
+                { value: "active", label: "Active " + root.activeCount },
+                { value: "expired", label: "Expired " + root.expiredCount, tooltip: "Schedules that never run again (h / l to switch)" }
+              ]
+              value: root.jobTab
+              focusable: false
+              spacing: Style.space(6)
               foreground: root.foreground
+              accent: root.accent
               fontFamily: root.fontFamily
+              fontSize: Style.font.caption
+              onChanged: function(value) { root.setJobTab(value) }
+            }
+
+            Text {
+              textFormat: Text.PlainText
+              visible: root.visibleJobs.length === 0
+              width: parent.width
+              text: root.jobTab === "expired"
+                ? "No expired jobs. One-shot jobs move here after their date passes."
+                : "No active jobs."
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.bodySmall
+              wrapMode: Text.WordWrap
             }
 
             Column {
@@ -310,7 +388,7 @@ Panel {
               spacing: Style.space(6)
 
               Repeater {
-                model: cron.jobs
+                model: root.visibleJobs
                 JobRow {
                   required property var modelData
                   required property int index
@@ -333,6 +411,7 @@ Panel {
     readonly property bool selected: root.cursorActive && root.selectedIndex === rowIndex
     readonly property bool expanded: selected
     readonly property bool hasPending: !!(job && job.pending)
+    readonly property bool confirming: !!(job && root.confirmRemove === job.name)
 
     hasCursor: selected
     foreground: root.foreground
@@ -484,6 +563,7 @@ Panel {
         }
 
         Flow {
+          visible: !jobRow.confirming
           width: parent.width
           spacing: Style.space(6)
 
@@ -498,6 +578,7 @@ Panel {
           }
 
           Button {
+            visible: !!(jobRow.job && !jobRow.job.expired)
             text: jobRow.job && jobRow.job.paused ? "Resume" : "Pause"
             foreground: root.foreground
             fontFamily: root.fontFamily
@@ -528,6 +609,51 @@ Panel {
             fontSize: Style.font.caption
             bordered: true
             onClicked: if (jobRow.job) cron.skip(jobRow.job.name)
+          }
+
+          Button {
+            text: "Remove"
+            tooltipText: "Delete this job and its timer; logs are kept (x)"
+            foreground: root.urgent
+            fontFamily: root.fontFamily
+            fontSize: Style.font.caption
+            bordered: true
+            enabled: !!(jobRow.job && !jobRow.job.running)
+            onClicked: root.requestRemove(jobRow.job)
+          }
+        }
+
+        RowLayout {
+          visible: jobRow.confirming
+          width: parent.width
+          spacing: Style.space(6)
+
+          Text {
+            textFormat: Text.PlainText
+            Layout.fillWidth: true
+            text: "Remove this job? Logs are kept."
+            color: root.urgent
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            wrapMode: Text.WordWrap
+          }
+
+          Button {
+            text: "Cancel"
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+            fontSize: Style.font.caption
+            bordered: true
+            onClicked: root.cancelRemove()
+          }
+
+          Button {
+            text: "Remove"
+            foreground: root.urgent
+            fontFamily: root.fontFamily
+            fontSize: Style.font.caption
+            bordered: true
+            onClicked: root.removeConfirmed()
           }
         }
       }
