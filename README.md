@@ -117,6 +117,11 @@ Failures, timeouts, and approval requests raise a desktop notification. The
 bar glyph takes the worst state across all jobs and badges how many are failed
 or waiting.
 
+A job whose schedule never elapses again, such as a one-shot date that has
+passed, is marked `expired` in `status --json` and moves to the panel's
+**Expired** tab. Switch tabs with `h` / `l` or a click. **Remove** (`x` on the
+selected row, then `x` or Enter to confirm, Esc to cancel) runs `agentcron rm`.
+
 ## Commands
 
 | Command | Does |

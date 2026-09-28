@@ -107,6 +107,7 @@ Item {
   function resume(name) { runAction("resume", name) }
   function approve(name) { runAction("approve", name) }
   function skip(name) { runAction("skip", name) }
+  function remove(name) { runAction("rm", name) }
 
   function runAction(verb, name) {
     var job = String(name || "")

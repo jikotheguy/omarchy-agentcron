@@ -7,6 +7,7 @@ function emptySummary() {
     attention: 0,
     waiting: 0,
     running: 0,
+    expired: 0,
     nextJob: "",
     nextRunAt: null
   }
@@ -61,6 +62,7 @@ function parseJob(raw) {
     paused: raw.paused === true,
     running: raw.running === true,
     nextRunAt: raw.nextRunAt ? String(raw.nextRunAt) : null,
+    expired: raw.expired === true,
     state: asString(raw.state) || "never",
     pending: pending,
     lastRun: lastRun,
@@ -90,6 +92,7 @@ function parseStatus(raw) {
   summary.attention = Math.max(0, asInt(summaryIn.attention, 0))
   summary.waiting = Math.max(0, asInt(summaryIn.waiting, 0))
   summary.running = Math.max(0, asInt(summaryIn.running, 0))
+  summary.expired = Math.max(0, asInt(summaryIn.expired, 0))
   summary.nextJob = asString(summaryIn.nextJob)
   summary.nextRunAt = summaryIn.nextRunAt ? String(summaryIn.nextRunAt) : null
 
@@ -200,6 +203,7 @@ function statusGlyph(state) {
 
 function jobNextLabel(job, nowMs) {
   if (!job) return ""
+  if (job.expired) return "expired"
   if (job.paused) return "paused"
   if (!job.nextRunAt) return "—"
   return relativeTime(job.nextRunAt, nowMs) || "—"
